@@ -28,6 +28,12 @@ class OptimizationConfig:
     max_iterations: int = 80
     min_spacing_multiple: float = 5.0
     seed: Optional[int] = 42
+    #: 周期性检查点文件路径；None 表示不启用，保持默认无断点流程。
+    checkpoint_path: Optional[str] = None
+    #: 每隔多少代/次迭代保存一次检查点。
+    checkpoint_interval: int = 10
+    #: 恢复策略：None=有断点自动恢复；True=必须恢复；False=必须新跑。
+    resume: Optional[bool] = None
 
 
 @dataclass

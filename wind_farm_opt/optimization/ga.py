@@ -11,6 +11,14 @@ from ..constraints.spacing import (
     compute_min_spacing_from_diameters,
     enforce_min_spacing,
 )
+from .checkpoint import (
+    CheckpointError,
+    CheckpointManager,
+    CheckpointSettings,
+    require_array,
+    require_scalar,
+    restore_rng_state,
+)
 
 
 @dataclass
@@ -39,6 +47,15 @@ class GAConfig:
         约束违反惩罚因子
     seed : Optional[int]
         随机种子
+    checkpoint_path : Optional[str]
+        周期性检查点文件路径；None（默认）表示不启用检查点，
+        保持无断点的默认运行流程不变。
+    checkpoint_interval : int
+        每隔多少代保存一次检查点（初始状态与最终状态会额外强制保存）。
+    resume : Optional[bool]
+        恢复策略：None 表示存在检查点则自动恢复、否则新跑；
+        True 表示必须从检查点恢复（缺失即报错）；
+        False 表示必须新跑（首次保存时原子替换旧文件）。
     """
 
     population_size: int = 50
@@ -51,6 +68,9 @@ class GAConfig:
     min_spacing_multiple: float = 5.0
     penalty_factor: float = 1e6
     seed: Optional[int] = None
+    checkpoint_path: Optional[str] = None
+    checkpoint_interval: int = 10
+    resume: Optional[bool] = None
 
 
 @dataclass
@@ -73,6 +93,9 @@ class OptimizeResult:
         最终种群 (pop_size, N_turb*2)
     final_fitness : np.ndarray
         最终种群适应度 (pop_size,)
+    run_provenance : Optional[dict]
+        运行台账：标明新跑（fresh）/恢复（resumed）、运行 ID、检查点来源等；
+        未启用检查点时为 None，默认无断点流程不受影响。
     """
 
     best_positions: np.ndarray
@@ -82,6 +105,7 @@ class OptimizeResult:
     mean_history: list[float]
     final_population: np.ndarray
     final_fitness: np.ndarray
+    run_provenance: Optional[dict] = None
 
 
 class GeneticAlgorithm:
@@ -136,6 +160,97 @@ class GeneticAlgorithm:
 
         self.convergence_history: list[float] = []
         self.mean_history: list[float] = []
+
+    # ------------------------------------------------------------------
+    # 检查点支持
+    # ------------------------------------------------------------------
+
+    def _checkpoint_settings(self) -> CheckpointSettings:
+        return CheckpointSettings(
+            path=self.config.checkpoint_path,
+            interval=self.config.checkpoint_interval,
+        )
+
+    def _fingerprint_inputs(self) -> dict:
+        """构造场地、风机、目标函数及算法行为相关配置的指纹输入。
+
+        不含检查点路径/间隔这类与续算正确性无关的运行选项；
+        必须包含 max_generations，因为 RNG 消耗序列与迭代次数绑定，
+        恢复到不同总迭代数的“等价性”无从保证，按不兼容处理更安全。
+        """
+        from .checkpoint import describe_fitness_function
+
+        return {
+            "problem": {
+                "n_turbines": int(self.n_turbines),
+                "rotor_diameters": self.rotor_diameters.tolist(),
+                "min_spacing_multiple": float(self.config.min_spacing_multiple),
+                "min_spacing": float(self.min_spacing),
+                "boundary_vertices": self.boundary.vertices.tolist(),
+            },
+            "fitness_function": describe_fitness_function(self.fitness_fn),
+            "algorithm": {
+                "name": "ga",
+                "population_size": int(self.config.population_size),
+                "max_generations": int(self.config.max_generations),
+                "crossover_rate": float(self.config.crossover_rate),
+                "mutation_rate": float(self.config.mutation_rate),
+                "mutation_strength": float(self.config.mutation_strength),
+                "elite_ratio": float(self.config.elite_ratio),
+                "tournament_size": int(self.config.tournament_size),
+                "penalty_factor": float(self.config.penalty_factor),
+                "seed": self.config.seed,
+            },
+        }
+
+    def _snapshot_state(
+        self,
+        population: np.ndarray,
+        fitness: np.ndarray,
+    ) -> dict:
+        """捕获足以无损继续计算的全部算法状态。"""
+        return {
+            "population": population.tolist(),
+            "fitness": fitness.tolist(),
+            "best_positions": np.asarray(self._best_positions, dtype=np.float64).tolist(),
+            "best_fitness": float(self._best_fitness),
+            "best_generation": int(self._best_generation),
+            "convergence_history": list(self.convergence_history),
+            "mean_history": list(self.mean_history),
+            "rng_state": self.rng.bit_generator.state,
+        }
+
+    def _restore_state(self, payload: dict) -> tuple[np.ndarray, np.ndarray, int]:
+        """从检查点恢复全部状态，返回 (种群, 适应度, 已完成代数)。"""
+        state = payload["state"]
+        pop_size = self.config.population_size
+        completed = int(payload["completed_iterations"])
+
+        population = require_array(state, "population", (pop_size, self.n_dim))
+        fitness = require_array(state, "fitness", (pop_size,))
+        best_positions = require_array(state, "best_positions", (self.n_turbines, 2))
+
+        n_hist = completed
+        conv = state.get("convergence_history")
+        mean = state.get("mean_history")
+        if not isinstance(conv, list) or len(conv) != n_hist:
+            raise CheckpointError(
+                f"检查点收敛历史长度与迭代位置不一致: {None if conv is None else len(conv)} != {n_hist}"
+            )
+        if not isinstance(mean, list) or len(mean) != n_hist:
+            raise CheckpointError(
+                f"检查点均值历史长度与迭代位置不一致: {None if mean is None else len(mean)} != {n_hist}"
+            )
+
+        restore_rng_state(self.rng, state.get("rng_state"))
+
+        self._best_positions = best_positions.copy()
+        self._best_fitness = float(require_scalar(state, "best_fitness", (int, float)))
+        self._best_generation = int(require_scalar(state, "best_generation", int))
+        self.convergence_history = [float(v) for v in conv]
+        self.mean_history = [float(v) for v in mean]
+
+        return population, fitness, completed
 
     def _initialize_population(self, pop_size: int) -> np.ndarray:
         """初始化种群。
@@ -293,6 +408,13 @@ class GeneticAlgorithm:
 
         n_elite = max(1, int(pop_size * self.config.elite_ratio))
 
+        manager = CheckpointManager(
+            algorithm="ga",
+            settings=self._checkpoint_settings(),
+            fingerprint_inputs=self._fingerprint_inputs(),
+        )
+        loaded = manager.start(self.config.resume)
+
         if verbose:
             print(f"\n=== 遗传算法优化开始 ===")
             print(f"风机台数: {self.n_turbines}")
@@ -301,17 +423,47 @@ class GeneticAlgorithm:
             print(f"最小间距: {self.min_spacing:.1f} m "
                   f"({self.config.min_spacing_multiple:.1f}倍转子直径)")
             print(f"场地面积: {self.boundary.area / 1e6:.2f} km²")
+            if manager.enabled:
+                print(f"检查点文件: {manager.abspath()} (每 {self.config.checkpoint_interval} 代保存)")
+                if manager.mode == "resumed":
+                    print(
+                        f"运行方式: 从断点恢复（第 {manager.resumed_from_iteration} 代，"
+                        f"第 {manager.resume_count} 次恢复，run_id={manager.run_id[:8]}）"
+                    )
+                else:
+                    print(f"运行方式: 全新运行 (run_id={manager.run_id[:8]})")
             print("=" * 35)
 
-        population = self._initialize_population(pop_size)
-        fitness = self._evaluate_population(population)
+        if loaded is not None:
+            population, fitness, start_gen = self._restore_state(loaded)
+            if start_gen >= max_gen:
+                if verbose:
+                    print(f"检查点已完成 {start_gen} 代（>= 目标 {max_gen} 代），直接产出结果")
+            if verbose:
+                print(
+                    f"[恢复] 已还原第 {start_gen} 代种群与随机数状态，"
+                    f"继续执行第 {start_gen + 1}~{max_gen} 代"
+                )
+        else:
+            population = self._initialize_population(pop_size)
+            fitness = self._evaluate_population(population)
 
-        best_idx = np.argmax(fitness)
-        self._best_fitness = fitness[best_idx]
-        self._best_positions = population[best_idx].reshape(self.n_turbines, 2)
-        self._best_generation = 0
+            best_idx = np.argmax(fitness)
+            self._best_fitness = float(fitness[best_idx])
+            self._best_positions = population[best_idx].reshape(self.n_turbines, 2)
+            self._best_generation = 0
+            start_gen = 0
 
-        for gen in range(max_gen):
+            # 初始状态强制落盘：昂贵的初始种群生成也不会因算力回收而丢失。
+            manager.checkpoint(
+                self._snapshot_state(population, fitness),
+                completed_iterations=0,
+                total_iterations=max_gen,
+                force=True,
+                verbose=verbose,
+            )
+
+        for gen in range(start_gen, max_gen):
             self.convergence_history.append(float(self._best_fitness))
             self.mean_history.append(float(np.mean(fitness)))
 
@@ -346,6 +498,15 @@ class GeneticAlgorithm:
                 ).copy()
                 self._best_generation = gen + 1
 
+            completed = gen + 1
+            manager.checkpoint(
+                self._snapshot_state(population, fitness),
+                completed_iterations=completed,
+                total_iterations=max_gen,
+                force=(completed == max_gen),
+                verbose=False,
+            )
+
             if verbose and (gen % 5 == 0 or gen == max_gen - 1):
                 print(
                     f"Gen {gen+1:3d} | "
@@ -359,6 +520,11 @@ class GeneticAlgorithm:
             print(f"优化完成!")
             print(f"最优净AEP: {self._best_fitness/1e3:.2f} GWh")
             print(f"找到最优解的代数: {self._best_generation}")
+            if manager.enabled and manager.mode == "resumed":
+                print(
+                    f"本次为断点恢复运行（来源: {manager.abspath()}，"
+                    f"自第 {manager.resumed_from_iteration} 代续算，共恢复 {manager.resume_count} 次）"
+                )
 
         return OptimizeResult(
             best_positions=self._best_positions.copy(),
@@ -368,4 +534,5 @@ class GeneticAlgorithm:
             mean_history=self.mean_history.copy(),
             final_population=population.copy(),
             final_fitness=fitness.copy(),
+            run_provenance=manager.provenance() if manager.enabled else None,
         )

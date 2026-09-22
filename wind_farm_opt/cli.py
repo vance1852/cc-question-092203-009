@@ -122,12 +122,17 @@ class WindFarmOptimizerCLI:
 
         algo = self.config.optimization.algorithm.lower()
 
+        opt_cfg = self.config.optimization
+
         if algo == "ga":
             ga_config = GAConfig(
-                population_size=self.config.optimization.population_size,
-                max_generations=self.config.optimization.max_iterations,
-                min_spacing_multiple=self.config.optimization.min_spacing_multiple,
-                seed=self.config.optimization.seed,
+                population_size=opt_cfg.population_size,
+                max_generations=opt_cfg.max_iterations,
+                min_spacing_multiple=opt_cfg.min_spacing_multiple,
+                seed=opt_cfg.seed,
+                checkpoint_path=opt_cfg.checkpoint_path,
+                checkpoint_interval=opt_cfg.checkpoint_interval,
+                resume=opt_cfg.resume,
             )
             optimizer = GeneticAlgorithm(
                 n_turbines=self.config.n_turbines,
@@ -138,10 +143,13 @@ class WindFarmOptimizerCLI:
             )
         elif algo == "pso":
             pso_config = PSOConfig(
-                swarm_size=self.config.optimization.population_size,
-                max_iterations=self.config.optimization.max_iterations,
-                min_spacing_multiple=self.config.optimization.min_spacing_multiple,
-                seed=self.config.optimization.seed,
+                swarm_size=opt_cfg.population_size,
+                max_iterations=opt_cfg.max_iterations,
+                min_spacing_multiple=opt_cfg.min_spacing_multiple,
+                seed=opt_cfg.seed,
+                checkpoint_path=opt_cfg.checkpoint_path,
+                checkpoint_interval=opt_cfg.checkpoint_interval,
+                resume=opt_cfg.resume,
             )
             optimizer = ParticleSwarmOptimizer(
                 n_turbines=self.config.n_turbines,
@@ -448,6 +456,9 @@ class WindFarmOptimizerCLI:
                 ],
             }
 
+        if getattr(self.optimize_result, "run_provenance", None) is not None:
+            results["optimization_run"] = self.optimize_result.run_provenance
+
         if self.economic_result is not None:
             results["economic"] = {
                 "total_capital_cost_yiyuan": float(self.economic_result.total_capital_cost / 1e4),
@@ -556,6 +567,10 @@ def build_argparser() -> argparse.ArgumentParser:
 
   # 启用风机台数扫描
   python -m wind_farm_opt --sweep --min-turbines 10 --max-turbines 30
+
+  # 启用周期性检查点，算力窗口被回收后用同一命令（或加 --resume）续算
+  python -m wind_farm_opt --checkpoint output/ga.ckpt.json --checkpoint-interval 5
+  python -m wind_farm_opt --checkpoint output/ga.ckpt.json --resume
         """,
     )
 
@@ -720,6 +735,42 @@ def build_argparser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help=(
+            "周期性检查点文件路径。配置后优化过程会按 --checkpoint-interval "
+            "原子保存完整状态；再次运行指向同一文件时自动从断点恢复。"
+        ),
+    )
+
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=None,
+        metavar="N",
+        help="每隔 N 代/次迭代保存一次检查点（默认 10）。",
+    )
+
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="必须从 --checkpoint 指定的断点恢复；断点缺失、损坏或与当前场地/模型不兼容时报错。",
+    )
+
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        default=False,
+        help=(
+            "忽略已有检查点强制全新运行；首次保存时原子替换旧检查点文件，"
+            "默认流程（未配置 --checkpoint）不受影响。"
+        ),
+    )
+
+    parser.add_argument(
         "--generate-config",
         type=str,
         default=None,
@@ -769,6 +820,20 @@ def main() -> int:
         config.optimization.max_iterations = args.iterations
     if args.seed is not None:
         config.optimization.seed = args.seed
+    if args.checkpoint is not None:
+        config.optimization.checkpoint_path = args.checkpoint
+    if args.checkpoint_interval is not None:
+        if args.checkpoint_interval < 1:
+            parser.error("--checkpoint-interval 必须 >= 1")
+        config.optimization.checkpoint_interval = args.checkpoint_interval
+    if args.resume and args.fresh:
+        parser.error("--resume 与 --fresh 不能同时使用")
+    if args.resume:
+        if not args.checkpoint:
+            parser.error("--resume 需要同时指定 --checkpoint PATH")
+        config.optimization.resume = True
+    elif args.fresh:
+        config.optimization.resume = False
     if args.electricity_price is not None:
         config.economic.electricity_price = args.electricity_price
     if args.discount_rate is not None:
