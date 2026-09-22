@@ -1,7 +1,7 @@
 """遗传算法优化器。"""
 
-from dataclasses import dataclass, field
-from typing import Callable, Optional
+from dataclasses import asdict, dataclass, field
+from typing import Callable, Mapping, Optional
 
 import numpy as np
 
@@ -11,6 +11,16 @@ from ..constraints.spacing import (
     compute_min_spacing_from_diameters,
     enforce_min_spacing,
 )
+from .checkpoint import (
+    CheckpointError,
+    CheckpointSettings,
+    CheckpointStore,
+    deserialize_rng_state,
+    serialize_rng_state,
+)
+
+#: GA 检查点状态结构版本；保存的数组集合/含义变化时递增。
+GA_PAYLOAD_VERSION = 1
 
 
 @dataclass
@@ -73,6 +83,8 @@ class OptimizeResult:
         最终种群 (pop_size, N_turb*2)
     final_fitness : np.ndarray
         最终种群适应度 (pop_size,)
+    run_info : Optional[dict]
+        运行信息（新跑/恢复、检查点来源等）；未启用检查点时为 None。
     """
 
     best_positions: np.ndarray
@@ -82,6 +94,7 @@ class OptimizeResult:
     mean_history: list[float]
     final_population: np.ndarray
     final_fitness: np.ndarray
+    run_info: Optional[dict] = None
 
 
 class GeneticAlgorithm:
@@ -98,6 +111,8 @@ class GeneticAlgorithm:
         boundary: SiteBoundary,
         fitness_fn: Callable[[np.ndarray], float],
         config: Optional[GAConfig] = None,
+        checkpoint: Optional[CheckpointSettings] = None,
+        fingerprint_parts: Optional[Mapping[str, object]] = None,
     ) -> None:
         """
         Parameters
@@ -112,12 +127,20 @@ class GeneticAlgorithm:
             适应度函数，输入位置数组 (N_turb, 2)，返回净AEP
         config : Optional[GAConfig]
             算法配置参数
+        checkpoint : Optional[CheckpointSettings]
+            检查点设置；为 None 时不保存/恢复，行为与默认流程完全一致。
+        fingerprint_parts : Optional[Mapping]
+            场地/风机/目标函数相关的指纹片段（通常由
+            :func:`build_problem_fingerprint_parts` 构造）。检查点只会在
+            指纹完全一致时恢复。
         """
         self.n_turbines = n_turbines
         self.rotor_diameters = np.asarray(rotor_diameters, dtype=np.float64)
         self.boundary = boundary
         self.fitness_fn = fitness_fn
         self.config = config if config is not None else GAConfig()
+        self.checkpoint_settings = checkpoint
+        self.extra_fingerprint_parts = dict(fingerprint_parts) if fingerprint_parts else {}
 
         self.rng = np.random.default_rng(self.config.seed)
 
@@ -136,6 +159,38 @@ class GeneticAlgorithm:
 
         self.convergence_history: list[float] = []
         self.mean_history: list[float] = []
+
+    def _fingerprint_parts(self) -> dict:
+        """组装完整指纹：问题物理配置 + GA 算法配置。
+
+        总代数 ``max_generations`` 不参与指纹：它属于运行预算而非问题定义，
+        允许在恢复时调整（断点文件中另行记录 total_steps）。
+        """
+        algo_config = asdict(self.config)
+        algo_config.pop("max_generations", None)
+        parts: dict = dict(self.extra_fingerprint_parts)
+        parts.setdefault("site", {}).update(
+            {
+                "boundary_type": type(self.boundary).__name__,
+                "vertices": np.asarray(
+                    self.boundary.vertices, dtype=np.float64
+                ).tolist(),
+            }
+        )
+        parts.setdefault("turbines", {}).update(
+            {
+                "count": int(self.n_turbines),
+                "rotor_diameters": self.rotor_diameters.tolist(),
+                "min_spacing_multiple": float(self.config.min_spacing_multiple),
+                "min_spacing": float(self.min_spacing),
+            }
+        )
+        parts["algorithm"] = {
+            "name": "ga",
+            "payload_version": GA_PAYLOAD_VERSION,
+            "config": algo_config,
+        }
+        return parts
 
     def _initialize_population(self, pop_size: int) -> np.ndarray:
         """初始化种群。
@@ -275,8 +330,60 @@ class GeneticAlgorithm:
 
         return positions.flatten()
 
+    # -- 检查点状态 -------------------------------------------------------
+
+    def _state_arrays(
+        self, population: np.ndarray, fitness: np.ndarray
+    ) -> dict[str, np.ndarray]:
+        """导出代数边界处的完整状态（此时下一代尚未消耗任何随机数）。"""
+        return {
+            "population": population,
+            "fitness": fitness,
+            "best_positions": np.asarray(self._best_positions, dtype=np.float64),
+            "best_fitness": np.asarray(self._best_fitness, dtype=np.float64),
+            "best_generation": np.asarray(self._best_generation, dtype=np.int64),
+            "convergence_history": np.asarray(
+                self.convergence_history, dtype=np.float64
+            ),
+            "mean_history": np.asarray(self.mean_history, dtype=np.float64),
+        }
+
+    def _restore_state(self, arrays: dict[str, np.ndarray], rng_state: bytes) -> int:
+        """从检查点恢复全部状态，返回已完成的代数。"""
+        self.rng = deserialize_rng_state(rng_state)
+        self._best_positions = arrays["best_positions"].reshape(
+            self.n_turbines, 2
+        ).copy()
+        self._best_fitness = float(arrays["best_fitness"])
+        self._best_generation = int(arrays["best_generation"])
+        self.convergence_history = arrays["convergence_history"].astype(
+            np.float64
+        ).tolist()
+        self.mean_history = arrays["mean_history"].astype(np.float64).tolist()
+        return len(self.convergence_history)
+
+    def _build_result(
+        self,
+        population: np.ndarray,
+        fitness: np.ndarray,
+        store: Optional[CheckpointStore],
+    ) -> OptimizeResult:
+        return OptimizeResult(
+            best_positions=self._best_positions.copy(),
+            best_fitness=float(self._best_fitness),
+            best_generation=self._best_generation,
+            convergence_history=self.convergence_history.copy(),
+            mean_history=self.mean_history.copy(),
+            final_population=population.copy(),
+            final_fitness=fitness.copy(),
+            run_info=store.result_info() if store is not None else None,
+        )
+
     def optimize(self, verbose: bool = True) -> OptimizeResult:
         """执行优化。
+
+        启用检查点且 ``resume=True`` 时，从兼容断点继续；否则从头新跑。
+        续算到与不中断运行相同的总代数时，两者的结果逐位一致。
 
         Parameters
         ----------
@@ -301,17 +408,59 @@ class GeneticAlgorithm:
             print(f"最小间距: {self.min_spacing:.1f} m "
                   f"({self.config.min_spacing_multiple:.1f}倍转子直径)")
             print(f"场地面积: {self.boundary.area / 1e6:.2f} km²")
+            if self.checkpoint_settings is not None:
+                print(f"检查点文件: {self.checkpoint_settings.path} "
+                      f"(每 {self.checkpoint_settings.interval} 代保存)")
             print("=" * 35)
 
-        population = self._initialize_population(pop_size)
-        fitness = self._evaluate_population(population)
+        store: Optional[CheckpointStore] = None
+        if self.checkpoint_settings is not None:
+            store = CheckpointStore(
+                self.checkpoint_settings,
+                algorithm="ga",
+                payload_version=GA_PAYLOAD_VERSION,
+                fingerprint_parts=self._fingerprint_parts(),
+                total_steps=max_gen,
+                shape_info={
+                    "n_turbines": int(self.n_turbines),
+                    "n_dim": int(self.n_dim),
+                    "population_size": int(pop_size),
+                },
+                verbose=verbose,
+            )
 
-        best_idx = np.argmax(fitness)
-        self._best_fitness = fitness[best_idx]
-        self._best_positions = population[best_idx].reshape(self.n_turbines, 2)
-        self._best_generation = 0
+        resumed = store.request_resume() if store is not None else None
 
-        for gen in range(max_gen):
+        if resumed is not None:
+            start_gen = self._restore_state(
+                resumed["arrays"], resumed["rng_state"]
+            )
+            population = resumed["arrays"]["population"]
+            fitness = resumed["arrays"]["fitness"]
+            if start_gen != resumed["completed_steps"]:
+                from .checkpoint import CheckpointError
+                raise CheckpointError(
+                    f"检查点历史长度 {start_gen} 与记录进度 "
+                    f"{resumed['completed_steps']} 不一致，拒绝恢复"
+                )
+        else:
+            population = self._initialize_population(pop_size)
+            fitness = self._evaluate_population(population)
+
+            best_idx = np.argmax(fitness)
+            self._best_fitness = float(fitness[best_idx])
+            self._best_positions = population[best_idx].reshape(
+                self.n_turbines, 2
+            ).copy()
+            self._best_generation = 0
+            start_gen = 0
+
+        if start_gen >= max_gen:
+            if verbose:
+                print("[检查点] 断点已达到总代数，直接输出既有结果")
+            return self._build_result(population, fitness, store)
+
+        for gen in range(start_gen, max_gen):
             self.convergence_history.append(float(self._best_fitness))
             self.mean_history.append(float(np.mean(fitness)))
 
@@ -346,6 +495,16 @@ class GeneticAlgorithm:
                 ).copy()
                 self._best_generation = gen + 1
 
+            completed = gen + 1
+
+            if store is not None and store.should_save(completed):
+                store.save(
+                    completed,
+                    self._state_arrays(population, fitness),
+                    serialize_rng_state(self.rng),
+                    status=("completed" if completed >= max_gen else "running"),
+                )
+
             if verbose and (gen % 5 == 0 or gen == max_gen - 1):
                 print(
                     f"Gen {gen+1:3d} | "
@@ -360,12 +519,4 @@ class GeneticAlgorithm:
             print(f"最优净AEP: {self._best_fitness/1e3:.2f} GWh")
             print(f"找到最优解的代数: {self._best_generation}")
 
-        return OptimizeResult(
-            best_positions=self._best_positions.copy(),
-            best_fitness=float(self._best_fitness),
-            best_generation=self._best_generation,
-            convergence_history=self.convergence_history.copy(),
-            mean_history=self.mean_history.copy(),
-            final_population=population.copy(),
-            final_fitness=fitness.copy(),
-        )
+        return self._build_result(population, fitness, store)

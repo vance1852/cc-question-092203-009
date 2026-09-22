@@ -21,6 +21,10 @@ from .farm.aep import AEPCalculator, FarmResult
 from .optimization.baseline import generate_grid_layout
 from .optimization.ga import GeneticAlgorithm, GAConfig
 from .optimization.pso import ParticleSwarmOptimizer, PSOConfig
+from .optimization.checkpoint import (
+    CheckpointSettings,
+    build_problem_fingerprint_parts,
+)
 from .economy.costs import (
     EconomicAnalyzer,
     EconomicResult,
@@ -68,6 +72,7 @@ class WindFarmOptimizerCLI:
         self.optimize_result = None
         self.economic_result: Optional[EconomicResult] = None
         self.sweep_results: Optional[dict] = None
+        self.checkpoint_settings: Optional[CheckpointSettings] = None
 
     def _setup_output_dir(self) -> None:
         """创建输出目录。"""
@@ -122,6 +127,17 @@ class WindFarmOptimizerCLI:
 
         algo = self.config.optimization.algorithm.lower()
 
+        fingerprint_parts = build_problem_fingerprint_parts(
+            boundary=self.boundary,
+            rotor_diameters=self.rotor_diameters,
+            turbines=self.turbines,
+            wind_resource=self.wind_resource,
+            wake_model=self.wake_model,
+            superposition_method=self.config.superposition_method,
+            speed_step=self.aep_calc.speed_step,
+            speed_max=self.aep_calc.speed_max,
+        )
+
         if algo == "ga":
             ga_config = GAConfig(
                 population_size=self.config.optimization.population_size,
@@ -135,6 +151,8 @@ class WindFarmOptimizerCLI:
                 boundary=self.boundary,
                 fitness_fn=fit_fn,
                 config=ga_config,
+                checkpoint=self.checkpoint_settings,
+                fingerprint_parts=fingerprint_parts,
             )
         elif algo == "pso":
             pso_config = PSOConfig(
@@ -149,12 +167,29 @@ class WindFarmOptimizerCLI:
                 boundary=self.boundary,
                 fitness_fn=fit_fn,
                 config=pso_config,
+                checkpoint=self.checkpoint_settings,
+                fingerprint_parts=fingerprint_parts,
             )
         else:
             raise ValueError(f"未知的优化算法: {algo}")
 
         print(f"使用优化算法: {algo.upper()}")
+        if self.checkpoint_settings is None:
+            print("运行模式: 全新运行（未启用检查点）")
         self.optimize_result = optimizer.optimize(verbose=True)
+
+        run_info = getattr(self.optimize_result, "run_info", None)
+        if run_info is not None:
+            if run_info["mode"] == "resumed":
+                print(
+                    f"运行模式: 断点恢复 —— 从 {run_info['resumed_from']} 的"
+                    f"第 {run_info['resumed_at_step']} 代/次继续"
+                )
+                print(f"检查点来源运行: {run_info['origin_run_id']} "
+                      f"(续算代数 {run_info['lineage']})")
+            else:
+                print("运行模式: 全新运行（启用检查点）")
+                print(f"检查点来源运行: {run_info['origin_run_id']}")
 
         self.optimized_positions = self.optimize_result.best_positions
         self.optimized_result = self.aep_calc.compute_farm_aep(self.optimized_positions)
@@ -448,6 +483,22 @@ class WindFarmOptimizerCLI:
                 ],
             }
 
+        if self.optimize_result is not None and getattr(
+            self.optimize_result, "run_info", None
+        ) is not None:
+            info = self.optimize_result.run_info
+            results["optimization_run"] = {
+                "mode": "resumed" if info["mode"] == "resumed" else "new",
+                "mode_label": "断点恢复" if info["mode"] == "resumed" else "全新运行",
+                "checkpoint_path": info["checkpoint_path"],
+                "resumed_from": info["resumed_from"],
+                "resumed_at_step": info["resumed_at_step"],
+                "origin_run_id": info["origin_run_id"],
+                "run_id": info["run_id"],
+                "lineage": info["lineage"],
+                "total_steps": info["total_steps"],
+            }
+
         if self.economic_result is not None:
             results["economic"] = {
                 "total_capital_cost_yiyuan": float(self.economic_result.total_capital_cost / 1e4),
@@ -720,6 +771,31 @@ def build_argparser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--checkpoint",
+        type=str,
+        nargs="?",
+        const="",
+        default=None,
+        help=(
+            "启用周期性检查点；可指定检查点文件路径，不指定时使用"
+            " 输出目录下的 <算法>_checkpoint.npz"
+        ),
+    )
+
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=10,
+        help="检查点保存周期（每 N 代/次迭代保存一次，默认 10）",
+    )
+
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="从 --checkpoint 指定的断点恢复；文件不兼容或损坏将报错且不覆盖",
+    )
+
+    parser.add_argument(
         "--generate-config",
         type=str,
         default=None,
@@ -785,6 +861,22 @@ def main() -> int:
     cli = WindFarmOptimizerCLI(config)
     cli._min_turbines = args.min_turbines
     cli._max_turbines = args.max_turbines
+
+    if args.checkpoint is not None or args.resume:
+        algo_name = config.optimization.algorithm.lower()
+        if args.checkpoint:
+            ckpt_path = args.checkpoint
+        else:
+            ckpt_path = os.path.join(
+                config.visualization.save_dir, f"{algo_name}_checkpoint.npz"
+            )
+        cli.checkpoint_settings = CheckpointSettings(
+            path=ckpt_path,
+            interval=args.checkpoint_interval,
+            resume=args.resume,
+        )
+        if args.resume:
+            print(f"将尝试从检查点恢复: {os.path.abspath(ckpt_path)}")
 
     try:
         cli.run_full_analysis(
